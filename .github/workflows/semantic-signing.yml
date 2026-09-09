@@ -3,40 +3,8 @@ name: Protected Semantic Receipt Signer
 on:
   workflow_dispatch:
     inputs:
-      contract_version:
-        description: Canonical attestation contract version
-        required: true
-        type: string
-      batch_id:
-        description: Opaque local batch identifier
-        required: true
-        type: string
-      subject:
-        description: Subject identifier only
-        required: true
-        type: string
-      form:
-        description: Form identifier only
-        required: true
-        type: string
-      request_sha256:
-        description: SHA-256 of canonical local signing request
-        required: true
-        type: string
-      requirements_digest:
-        description: SHA-256 of requirements provenance
-        required: true
-        type: string
-      provenance_digest:
-        description: SHA-256 of local provenance record
-        required: true
-        type: string
-      source_manifest_digest:
-        description: SHA-256 of certified source manifest
-        required: true
-        type: string
-      blueprint_digest:
-        description: SHA-256 of blueprint record
+      payload_batch_b64:
+        description: Canonical hash-only semantic receipt batch
         required: true
         type: string
 
@@ -44,7 +12,7 @@ permissions: {}
 
 jobs:
   sign:
-    name: Sign approved semantic receipt
+    name: Sign approved canonical semantic receipts
     runs-on: ubuntu-latest
     environment:
       name: semantic-signing
@@ -56,65 +24,75 @@ jobs:
         with:
           cosign-release: v2.5.2
 
-      - name: Build canonical non-proprietary receipt
+      - name: Validate and materialize exact canonical payloads
         shell: bash
         env:
-          CONTRACT_VERSION: ${{ inputs.contract_version }}
-          BATCH_ID: ${{ inputs.batch_id }}
-          SUBJECT: ${{ inputs.subject }}
-          FORM: ${{ inputs.form }}
-          REQUEST_SHA256: ${{ inputs.request_sha256 }}
-          REQUIREMENTS_DIGEST: ${{ inputs.requirements_digest }}
-          PROVENANCE_DIGEST: ${{ inputs.provenance_digest }}
-          SOURCE_MANIFEST_DIGEST: ${{ inputs.source_manifest_digest }}
-          BLUEPRINT_DIGEST: ${{ inputs.blueprint_digest }}
+          PAYLOAD_BATCH_B64: ${{ inputs.payload_batch_b64 }}
+          SIGNER_REPOSITORY: ${{ github.repository }}
+          SIGNER_WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
           set -euo pipefail
-          digest_names=(REQUEST_SHA256 REQUIREMENTS_DIGEST PROVENANCE_DIGEST SOURCE_MANIFEST_DIGEST BLUEPRINT_DIGEST)
-          for digest_name in "${digest_names[@]}"; do
-            digest="${!digest_name}"
-            [[ "$digest" =~ ^[a-f0-9]{64}$ ]] || { echo "invalid SHA-256 input: $digest_name" >&2; exit 64; }
-          done
-          [[ "$CONTRACT_VERSION" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || { echo 'invalid contract_version' >&2; exit 64; }
-          [[ "$BATCH_ID" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || { echo 'invalid batch_id' >&2; exit 64; }
-          [[ "$SUBJECT" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || { echo 'invalid subject' >&2; exit 64; }
-          [[ "$FORM" =~ ^[A-Za-z0-9._-]{1,32}$ ]] || { echo 'invalid form' >&2; exit 64; }
-          jq -cnS \
-            --arg contract_version "$CONTRACT_VERSION" \
-            --arg batch_id "$BATCH_ID" \
-            --arg subject "$SUBJECT" \
-            --arg form "$FORM" \
-            --arg request_sha256 "$REQUEST_SHA256" \
-            --arg requirements_digest "$REQUIREMENTS_DIGEST" \
-            --arg provenance_digest "$PROVENANCE_DIGEST" \
-            --arg source_manifest_digest "$SOURCE_MANIFEST_DIGEST" \
-            --arg blueprint_digest "$BLUEPRINT_DIGEST" \
-            --arg repository "${{ github.repository }}" \
-            --arg workflow_ref "${{ github.workflow_ref }}" \
-            --arg environment 'semantic-signing' \
-            --arg run_id "${{ github.run_id }}" \
-            --arg run_attempt "${{ github.run_attempt }}" \
-            --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{attestation_type:"score-master-semantic-receipt",contract_version:$contract_version,batch_id:$batch_id,subject:$subject,form:$form,request_sha256:$request_sha256,requirements_digest:$requirements_digest,provenance_digest:$provenance_digest,source_manifest_digest:$source_manifest_digest,blueprint_digest:$blueprint_digest,signer_repository:$repository,signer_workflow_ref:$workflow_ref,signer_environment:$environment,github_run_id:$run_id,github_run_attempt:$run_attempt,generated_at:$generated_at}' \
-            > semantic-receipt.json
+          mkdir -p receipts
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, re, sys
+          def no_dupes(pairs):
+              out = {}
+              for key, value in pairs:
+                  if key in out: raise ValueError('duplicate JSON key')
+                  out[key] = value
+              return out
+          def load(raw):
+              return json.loads(raw.decode('utf-8'), object_pairs_hook=no_dupes, parse_float=lambda _: (_ for _ in ()).throw(ValueError('floats forbidden')))
+          def canon(value):
+              return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False).encode('utf-8') + b'\n'
+          digest = re.compile(r'^[a-f0-9]{64}$'); ident = re.compile(r'^[A-Za-z0-9._-]{1,128}$')
+          payload_keys = {'receipt_contract_version','semantic_core_contract_version','signer_contract_version','batch_id','request_id','subject_id','form','semantic_target_type','semantic_target_id','requirement_set_id','requirements','provenance_binding','source_manifest','source_evidence_binding_digest','blueprint_binding','semantic_review','semantic_review_payload_sha256','canonical_batch_sha256','issued_at','expires_at','receipt_id','nonce','signer_repository','signer_workflow_ref','signer_environment'}
+          try:
+              batch = load(base64.b64decode(os.environ['PAYLOAD_BATCH_B64'], validate=True))
+              if set(batch) != {'batch_contract_version','payloads'} or batch['batch_contract_version'] != 'SIGSTORE_SEMANTIC_RECEIPT_BATCH_V1' or not isinstance(batch['payloads'], list) or not 1 <= len(batch['payloads']) <= 8: raise ValueError('invalid canonical batch')
+              prior = ''
+              for encoded in batch['payloads']:
+                  if not isinstance(encoded, str): raise ValueError('payload encoding invalid')
+                  raw = base64.b64decode(encoded, validate=True); item = load(raw)
+                  if set(item) != payload_keys or canon(item) != raw: raise ValueError('payload is not closed canonical JSON')
+                  if item['signer_repository'] != os.environ['SIGNER_REPOSITORY'] or item['signer_workflow_ref'] != os.environ['SIGNER_WORKFLOW_REF'] or item['signer_environment'] != 'semantic-signing': raise ValueError('signer identity binding mismatch')
+                  for key in ('receipt_contract_version','semantic_core_contract_version','signer_contract_version','batch_id','request_id','subject_id','form','semantic_target_type','semantic_target_id','receipt_id','nonce'):
+                      if not isinstance(item[key], str) or not ident.fullmatch(item[key]): raise ValueError('invalid identifier')
+                  for key in ('source_evidence_binding_digest','semantic_review_payload_sha256','canonical_batch_sha256'):
+                      if not isinstance(item[key], str) or not digest.fullmatch(item[key]): raise ValueError('invalid digest')
+                  reqs = item['requirements']
+                  if not isinstance(reqs, list) or not reqs or reqs != sorted(reqs, key=lambda x: (x.get('requirement_id',''), x.get('requirement_version',''), x.get('requirement_sha256',''))): raise ValueError('requirements ordering invalid')
+                  for req in reqs:
+                      if set(req) != {'requirement_id','requirement_version','requirement_sha256'} or not ident.fullmatch(req['requirement_id']) or not ident.fullmatch(req['requirement_version']) or not digest.fullmatch(req['requirement_sha256']): raise ValueError('invalid requirement')
+                  for name, keys in (('provenance_binding',{'provenance_binding_id','provenance_sha256'}),('source_manifest',{'source_manifest_id','source_manifest_version','source_manifest_sha256'})):
+                      value=item[name]
+                      if set(value) != keys or any(not isinstance(x,str) for x in value.values()): raise ValueError('invalid '+name)
+                  review=item['semantic_review']
+                  if set(review) != {'dimensions','semantic_review_outcome','semantic_findings','blocking_findings'} or set(review['dimensions']) != {'S1','S2','S3','S4','S5','S6','S7','S8'}: raise ValueError('invalid semantic review')
+                  if hashlib.sha256(canon(review)).hexdigest() != item['semantic_review_payload_sha256']: raise ValueError('semantic review digest mismatch')
+                  batch_view=dict(item); batch_view['canonical_batch_sha256']=None
+                  if hashlib.sha256(canon(batch_view)).hexdigest() != item['canonical_batch_sha256']: raise ValueError('canonical batch digest mismatch')
+                  if item['receipt_id'] <= prior: raise ValueError('payload order invalid')
+                  prior=item['receipt_id']; pathlib.Path('receipts', item['receipt_id'] + '.json').write_bytes(raw)
+          except Exception as error:
+              print('canonical payload rejection:', error, file=sys.stderr); raise SystemExit(64)
+          PY
 
-      - name: Keyless sign receipt with GitHub OIDC
+      - name: Keyless sign canonical payloads with GitHub OIDC
         shell: bash
         run: |
           set -euo pipefail
-          token_response="$(curl --fail-with-body --silent --show-error \
-            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sigstore")"
+          token_response="$(curl --fail-with-body --silent --show-error -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sigstore")"
           export SIGSTORE_ID_TOKEN="$(jq -er '.value' <<< "$token_response")"
-          cosign sign-blob --yes --bundle semantic-receipt.sigstore.json semantic-receipt.json
+          for receipt in receipts/*.json; do
+            cosign sign-blob --yes --bundle "${receipt%.json}.sigstore.json" "$receipt"
+          done
           unset SIGSTORE_ID_TOKEN
 
       - name: Publish signed receipt evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: semantic-receipt-${{ github.run_id }}
-          path: |
-            semantic-receipt.json
-            semantic-receipt.sigstore.json
+          name: semantic-receipt-batch-${{ github.run_id }}
+          path: receipts/
           if-no-files-found: error
           retention-days: 7
