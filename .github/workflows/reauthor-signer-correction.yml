@@ -1,0 +1,29 @@
+name: Reauthor protected signer correction
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  reauthor:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - name: Create bot-authored correction pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch origin semantic-signer-v1
+          git checkout -B sigstore-binding-correction-bot origin/semantic-signer-v1
+          git checkout "$GITHUB_SHA" -- .github/workflows/semantic-signing.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/workflows/semantic-signing.yml
+          git commit -m 'Bind full canonical semantic payload in keyless receipts'
+          git push origin HEAD:refs/heads/sigstore-binding-correction-bot
+          gh pr create --base semantic-signer-v1 --head sigstore-binding-correction-bot --title 'Bind full canonical semantic payload in keyless receipts' --body 'Bot-authored protected workflow correction. The trigger App retains Actions-only permissions; no signing key or secret is added.'
