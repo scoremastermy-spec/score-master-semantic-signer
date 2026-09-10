@@ -3,8 +3,12 @@ name: Protected semantic receipt signing
 on:
   workflow_dispatch:
     inputs:
-      payload_batch_b64:
+      canonical_payload_b64:
         description: Canonical hash-only semantic receipt request batch, base64-encoded UTF-8 JSON
+        required: true
+        type: string
+      canonical_payload_sha256:
+        description: SHA-256 of exact canonical UTF-8 bytes
         required: true
         type: string
 
@@ -25,7 +29,8 @@ jobs:
 
       - name: Decode and validate canonical request batch
         env:
-          PAYLOAD_BATCH_B64: ${{ inputs.payload_batch_b64 }}
+          CANONICAL_PAYLOAD_B64: ${{ inputs.canonical_payload_b64 }}
+          CANONICAL_PAYLOAD_SHA256: ${{ inputs.canonical_payload_sha256 }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
         shell: python
@@ -58,7 +63,7 @@ jobs:
 
           def canonical(value):
               return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-                  allow_nan=False).encode("utf-8") + b"\\n"
+                  allow_nan=False).encode("utf-8")
 
           def digest(value):
               return hashlib.sha256(canonical(value)).hexdigest()
@@ -152,11 +157,17 @@ jobs:
               require_digest_records("semantic_findings", value["semantic_findings"])
               require_digest_records("blocking_findings", value["blocking_findings"])
 
-          raw = base64.b64decode(os.environ["PAYLOAD_BATCH_B64"], validate=True)
+          raw = base64.b64decode(os.environ["CANONICAL_PAYLOAD_B64"], validate=True)
+          if not DIGEST.fullmatch(os.environ["CANONICAL_PAYLOAD_SHA256"]):
+              raise ValueError("transport SHA-256 is invalid")
+          if hashlib.sha256(raw).hexdigest() != os.environ["CANONICAL_PAYLOAD_SHA256"]:
+              raise ValueError("transport bytes do not match dispatched SHA-256")
           batch = parse(raw)
           reject_noncanonical_types(batch)
           if raw != canonical(batch):
               raise ValueError("request batch is not canonical UTF-8 JSON")
+          if hashlib.sha256(canonical(batch)).hexdigest() != os.environ["CANONICAL_PAYLOAD_SHA256"]:
+              raise ValueError("canonical SHA-256 does not match dispatched SHA-256")
           batch_keys = {
               "batch_contract_version", "signer_contract_version", "signer_repository", "signer_workflow_ref",
               "signer_environment", "batch_id", "request_id", "issued_at", "expires_at",
