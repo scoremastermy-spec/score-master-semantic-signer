@@ -3,12 +3,12 @@ name: Protected semantic receipt signing
 on:
   workflow_dispatch:
     inputs:
-      canonical_payload_b64:
-        description: Canonical hash-only semantic receipt request batch, base64-encoded UTF-8 JSON
+      receipt_envelope_b64:
+        description: Canonical transport-only envelope containing opaque final receipt bytes
         required: true
         type: string
-      canonical_payload_sha256:
-        description: SHA-256 of exact canonical UTF-8 bytes
+      receipt_envelope_sha256:
+        description: SHA-256 of the exact canonical transport-envelope bytes
         required: true
         type: string
 
@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   sign:
-    name: Sign canonical semantic receipts
+    name: Sign final canonical semantic receipts
     runs-on: ubuntu-latest
     environment: semantic-signing
     steps:
@@ -27,16 +27,14 @@ jobs:
         with:
           cosign-release: v2.5.2
 
-      - name: Decode and validate canonical request batch
+      - name: Decode validate and preserve final receipt bytes
         env:
-          CANONICAL_PAYLOAD_B64: ${{ inputs.canonical_payload_b64 }}
-          CANONICAL_PAYLOAD_SHA256: ${{ inputs.canonical_payload_sha256 }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          RECEIPT_ENVELOPE_B64: ${{ inputs.receipt_envelope_b64 }}
+          RECEIPT_ENVELOPE_SHA256: ${{ inputs.receipt_envelope_sha256 }}
         shell: python
         run: |
           import base64, hashlib, json, os, re
-          from datetime import datetime, timezone
+          from datetime import datetime
           from pathlib import Path
 
           REPOSITORY = "scoremastermy-spec/score-master-semantic-signer"
@@ -58,30 +56,17 @@ jobs:
               raise ValueError("numbers are forbidden")
 
           def parse(raw):
-              return json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate,
-                  parse_int=reject_number, parse_float=reject_number, parse_constant=reject_number)
+              return json.loads(
+                  raw.decode("utf-8"), object_pairs_hook=reject_duplicate,
+                  parse_int=reject_number, parse_float=reject_number,
+                  parse_constant=reject_number,
+              )
 
           def canonical(value):
-              return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-                  allow_nan=False).encode("utf-8")
-
-          def digest(value):
-              return hashlib.sha256(canonical(value)).hexdigest()
-
-          def require_id(name, value):
-              if not isinstance(value, str) or not IDENTIFIER.fullmatch(value):
-                  raise ValueError(f"{name} is not a bounded opaque identifier")
-
-          def require_digest(name, value):
-              if not isinstance(value, str) or not DIGEST.fullmatch(value):
-                  raise ValueError(f"{name} is not a lowercase SHA-256 digest")
-
-          def require_time(name, value):
-              if not isinstance(value, str) or not TIME.fullmatch(value):
-                  raise ValueError(f"{name} must be second-precision RFC3339 UTC")
-              parsed = datetime.fromisoformat(value[:-1] + "+00:00")
-              if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
-                  raise ValueError(f"{name} is not canonical second-precision RFC3339 UTC")
+              return json.dumps(
+                  value, sort_keys=True, separators=(",", ":"),
+                  ensure_ascii=False, allow_nan=False,
+              ).encode("utf-8")
 
           def reject_noncanonical_types(value):
               if value is None or isinstance(value, str):
@@ -98,6 +83,21 @@ jobs:
                   return
               raise ValueError("booleans and numbers are forbidden")
 
+          def require_id(name, value):
+              if not isinstance(value, str) or not IDENTIFIER.fullmatch(value):
+                  raise ValueError(f"{name} is not a bounded opaque identifier")
+
+          def require_digest(name, value):
+              if not isinstance(value, str) or not DIGEST.fullmatch(value):
+                  raise ValueError(f"{name} is not a lowercase SHA-256 digest")
+
+          def require_time(name, value):
+              if not isinstance(value, str) or not TIME.fullmatch(value):
+                  raise ValueError(f"{name} must be second-precision RFC3339 UTC")
+              parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+              if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
+                  raise ValueError(f"{name} is not canonical second-precision RFC3339 UTC")
+
           def require_digest_records(name, value):
               if not isinstance(value, list):
                   raise ValueError(f"{name} must be a list")
@@ -112,36 +112,53 @@ jobs:
                       raise ValueError(f"{name} must be strict canonical order")
                   previous = marker
 
-          def validate_receipt_request(value):
+          def validate_final_receipt(value):
               keys = {
-                  "receipt_contract_version", "semantic_core_contract_version", "semantic_target_type",
-                  "semantic_target_id", "subject", "form", "requirements", "provenance_binding_id",
-                  "provenance_binding_sha256", "source_manifest_id", "source_manifest_version",
-                  "source_manifest_sha256", "source_evidence_digest", "blueprint_binding_version",
-                  "blueprint_binding_sha256", "s1_s8", "semantic_outcome", "semantic_findings",
-                  "blocking_findings", "review_payload_sha256", "receipt_id", "nonce"
+                  "attestation_type", "receipt_contract_version", "signer_contract_version",
+                  "semantic_core_contract_version", "signer_repository", "signer_workflow_ref",
+                  "signer_environment", "receipt_id", "batch_id", "request_id", "subject_id",
+                  "form", "semantic_target_type", "semantic_target_id", "requirements",
+                  "provenance_binding_id", "provenance_binding_sha256", "source_manifest_id",
+                  "source_manifest_version", "source_manifest_sha256", "source_evidence_digest",
+                  "blueprint_binding_version", "blueprint_binding_sha256", "s1_s8",
+                  "semantic_outcome", "semantic_findings", "blocking_findings",
+                  "review_payload_sha256", "nonce", "issued_at", "expires_at",
               }
               if not isinstance(value, dict) or set(value) != keys:
-                  raise ValueError("receipt request has an unrecognised field set")
-              for name in ("receipt_contract_version", "semantic_core_contract_version", "semantic_target_type",
-                           "semantic_target_id", "subject", "form", "provenance_binding_id",
-                           "source_manifest_id", "source_manifest_version", "receipt_id", "nonce"):
+                  raise ValueError("final receipt has an unrecognised field set")
+              if value["attestation_type"] != "score-master-semantic-receipt":
+                  raise ValueError("wrong attestation type")
+              if value["signer_contract_version"] != "SEMANTIC_SIGNER_V1":
+                  raise ValueError("wrong signer contract")
+              if (value["signer_repository"], value["signer_workflow_ref"], value["signer_environment"]) != (REPOSITORY, WORKFLOW_REF, ENVIRONMENT):
+                  raise ValueError("wrong static signer identity")
+              for name in (
+                  "receipt_contract_version", "semantic_core_contract_version", "receipt_id",
+                  "batch_id", "request_id", "subject_id", "form", "semantic_target_type",
+                  "semantic_target_id", "provenance_binding_id", "source_manifest_id",
+                  "source_manifest_version", "nonce",
+              ):
                   require_id(name, value[name])
-              for name in ("provenance_binding_sha256", "source_manifest_sha256", "source_evidence_digest",
-                           "review_payload_sha256"):
+              for name in (
+                  "provenance_binding_sha256", "source_manifest_sha256",
+                  "source_evidence_digest", "review_payload_sha256",
+              ):
                   require_digest(name, value[name])
-              if value["blueprint_binding_version"] is not None:
-                  require_id("blueprint_binding_version", value["blueprint_binding_version"])
-              if value["blueprint_binding_sha256"] is not None:
-                  require_digest("blueprint_binding_sha256", value["blueprint_binding_sha256"])
+              for name in ("issued_at", "expires_at"):
+                  require_time(name, value[name])
+              if value["expires_at"] <= value["issued_at"]:
+                  raise ValueError("expiry must be after issue time")
               if (value["blueprint_binding_version"] is None) != (value["blueprint_binding_sha256"] is None):
                   raise ValueError("blueprint binding must be complete or null")
+              if value["blueprint_binding_version"] is not None:
+                  require_id("blueprint_binding_version", value["blueprint_binding_version"])
+                  require_digest("blueprint_binding_sha256", value["blueprint_binding_sha256"])
               if not isinstance(value["requirements"], list) or not value["requirements"]:
                   raise ValueError("requirements must be a non-empty list")
               previous = None
               for requirement in value["requirements"]:
                   if not isinstance(requirement, dict) or set(requirement) != {"id", "version", "sha256"}:
-                      raise ValueError("requirements must contain only id, version, sha256")
+                      raise ValueError("invalid requirement binding")
                   require_id("requirement.id", requirement["id"])
                   require_id("requirement.version", requirement["version"])
                   require_digest("requirement.sha256", requirement["sha256"])
@@ -151,74 +168,65 @@ jobs:
                   previous = marker
               if not isinstance(value["s1_s8"], dict) or set(value["s1_s8"]) != {f"S{i}" for i in range(1, 9)}:
                   raise ValueError("s1_s8 must contain exactly S1 through S8")
-              for state in value["s1_s8"].values():
-                  if state not in {"PASS", "FAIL", "BLOCKING", "NOT_APPLICABLE", "PROTECTED_GITHUB_SIGSTORE_KEYLESS"}:
-                      raise ValueError("invalid review state")
+              allowed_states = {"PASS", "FAIL", "BLOCKING", "NOT_APPLICABLE", "PROTECTED_GITHUB_SIGSTORE_KEYLESS"}
+              if any(state not in allowed_states for state in value["s1_s8"].values()):
+                  raise ValueError("invalid S1-S8 state")
               if value["semantic_outcome"] not in {"PASS", "FAIL"}:
                   raise ValueError("invalid semantic outcome")
               require_digest_records("semantic_findings", value["semantic_findings"])
               require_digest_records("blocking_findings", value["blocking_findings"])
 
-          raw = base64.b64decode(os.environ["CANONICAL_PAYLOAD_B64"], validate=True)
-          if not DIGEST.fullmatch(os.environ["CANONICAL_PAYLOAD_SHA256"]):
-              raise ValueError("transport SHA-256 is invalid")
-          if hashlib.sha256(raw).hexdigest() != os.environ["CANONICAL_PAYLOAD_SHA256"]:
-              raise ValueError("transport bytes do not match dispatched SHA-256")
-          batch = parse(raw)
-          reject_noncanonical_types(batch)
-          if raw != canonical(batch):
-              raise ValueError("request batch is not canonical UTF-8 JSON")
-          if hashlib.sha256(canonical(batch)).hexdigest() != os.environ["CANONICAL_PAYLOAD_SHA256"]:
-              raise ValueError("canonical SHA-256 does not match dispatched SHA-256")
-          batch_keys = {
-              "batch_contract_version", "signer_contract_version", "signer_repository", "signer_workflow_ref",
-              "signer_environment", "batch_id", "request_id", "issued_at", "expires_at",
-              "canonical_batch_sha256", "receipt_requests"
-          }
-          if not isinstance(batch, dict) or set(batch) != batch_keys:
-              raise ValueError("request batch has an unrecognised field set")
-          if batch["batch_contract_version"] != "SCORE_MASTER_SEMANTIC_BATCH_V1":
-              raise ValueError("unsupported batch contract")
-          if batch["signer_contract_version"] != "SEMANTIC_SIGNER_V1":
-              raise ValueError("unsupported signer contract")
-          if (batch["signer_repository"], batch["signer_workflow_ref"], batch["signer_environment"]) != (REPOSITORY, WORKFLOW_REF, ENVIRONMENT):
-              raise ValueError("unexpected static signer identity")
-          for name in ("batch_id", "request_id"):
-              require_id(name, batch[name])
-          for name in ("issued_at", "expires_at"):
-              require_time(name, batch[name])
-          require_digest("canonical_batch_sha256", batch["canonical_batch_sha256"])
-          if not isinstance(batch["receipt_requests"], list) or not (1 <= len(batch["receipt_requests"]) <= 20):
-              raise ValueError("receipt request batch must contain one to twenty entries")
-          for entry in batch["receipt_requests"]:
-              validate_receipt_request(entry)
-          unsigned_batch = dict(batch)
-          unsigned_batch["canonical_batch_sha256"] = None
-          if digest(unsigned_batch) != batch["canonical_batch_sha256"]:
-              raise ValueError("canonical batch digest mismatch")
-          issued_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-          output = Path("receipts")
-          output.mkdir()
-          for request in batch["receipt_requests"]:
-              receipt = {
-                  "attestation_type": "score-master-semantic-receipt",
-                  "receipt_contract_version": request["receipt_contract_version"],
-                  "semantic_core_contract_version": request["semantic_core_contract_version"],
-                  "signer_contract_version": batch["signer_contract_version"],
-                  "signer_repository": REPOSITORY,
-                  "signer_workflow_ref": WORKFLOW_REF,
-                  "signer_environment": ENVIRONMENT,
-                  "batch_id": batch["batch_id"], "request_id": batch["request_id"],
-                  "issued_at": batch["issued_at"], "expires_at": batch["expires_at"],
-                  "canonical_batch_sha256": batch["canonical_batch_sha256"],
-                  "github_run_id": os.environ["GITHUB_RUN_ID"],
-                  "github_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
-                  "generated_at": issued_at, **request,
-              }
-              receipt_path = output / f"{request['receipt_id']}.json"
-              receipt_path.write_bytes(canonical(receipt))
+          envelope_raw = base64.b64decode(os.environ["RECEIPT_ENVELOPE_B64"], validate=True)
+          expected_envelope_sha = os.environ["RECEIPT_ENVELOPE_SHA256"]
+          require_digest("transport envelope SHA-256", expected_envelope_sha)
+          if hashlib.sha256(envelope_raw).hexdigest() != expected_envelope_sha:
+              raise ValueError("transport envelope bytes do not match dispatched SHA-256")
+          envelope = parse(envelope_raw)
+          reject_noncanonical_types(envelope)
+          if envelope_raw != canonical(envelope):
+              raise ValueError("transport envelope is not canonical UTF-8 JSON")
+          if hashlib.sha256(canonical(envelope)).hexdigest() != expected_envelope_sha:
+              raise ValueError("canonical transport envelope SHA-256 mismatch")
+          if not isinstance(envelope, dict) or set(envelope) != {"batch_transport_version", "receipts"}:
+              raise ValueError("transport envelope has an unrecognised field set")
+          if envelope["batch_transport_version"] != "SCORE_MASTER_SEMANTIC_RECEIPT_TRANSPORT_V1":
+              raise ValueError("unsupported transport envelope contract")
+          if not isinstance(envelope["receipts"], list) or not (1 <= len(envelope["receipts"]) <= 20):
+              raise ValueError("transport envelope must contain one to twenty receipts")
 
-      - name: Sign every canonical receipt with GitHub OIDC keyless identity
+          receipts_dir = Path("receipts")
+          proof_dir = Path("transport-proof")
+          receipts_dir.mkdir()
+          proof_dir.mkdir()
+          names = set()
+          decoded_digests = []
+          for entry in envelope["receipts"]:
+              if not isinstance(entry, dict) or set(entry) != {"receipt_name", "receipt_b64", "receipt_sha256"}:
+                  raise ValueError("transport receipt entry has an unrecognised field set")
+              require_id("receipt_name", entry["receipt_name"])
+              require_digest("receipt_sha256", entry["receipt_sha256"])
+              if entry["receipt_name"] in names:
+                  raise ValueError("transport receipt names must be unique")
+              names.add(entry["receipt_name"])
+              receipt_raw = base64.b64decode(entry["receipt_b64"], validate=True)
+              if hashlib.sha256(receipt_raw).hexdigest() != entry["receipt_sha256"]:
+                  raise ValueError("final receipt bytes do not match dispatched SHA-256")
+              receipt = parse(receipt_raw)
+              reject_noncanonical_types(receipt)
+              if receipt_raw != canonical(receipt):
+                  raise ValueError("final receipt is not canonical UTF-8 JSON")
+              validate_final_receipt(receipt)
+              if receipt["receipt_id"] != entry["receipt_name"]:
+                  raise ValueError("transport receipt name does not bind receipt_id")
+              # This is the exact decoded local byte stream. Do not replace it.
+              (receipts_dir / f"{entry['receipt_name']}.json").write_bytes(receipt_raw)
+              decoded_digests.append({"receipt_name": entry["receipt_name"], "receipt_sha256": entry["receipt_sha256"]})
+          (proof_dir / "decoded-receipt-digests.json").write_bytes(canonical({
+              "outer_batch_transport_sha256": expected_envelope_sha,
+              "receipts": decoded_digests,
+          }))
+
+      - name: Sign exact decoded final receipt bytes with GitHub OIDC identity
         shell: bash
         run: |
           set -euo pipefail
@@ -226,9 +234,11 @@ jobs:
             cosign sign-blob --yes --bundle "${receipt%.json}.sigstore.json" "$receipt"
           done
 
-      - name: Upload portable Sigstore receipt bundle
+      - name: Upload portable Sigstore receipt bundle and transport proof
         uses: actions/upload-artifact@v4
         with:
           name: semantic-sigstore-receipts-${{ github.run_id }}-${{ github.run_attempt }}
-          path: receipts/
+          path: |
+            receipts/
+            transport-proof/
           if-no-files-found: error
